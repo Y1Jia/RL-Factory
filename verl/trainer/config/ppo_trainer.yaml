@@ -456,6 +456,8 @@ actor_rollout_ref:
       # To reduce excessive warnings, you can turn off the sanity check for these models if you are using their default chat template:
       # Qwen/QwQ-32B, Qwen/Qwen3-xxB
       enable_tokenization_sanity_check: True
+
+      format: 'hermes'
   env:
     name: base
     model_type: null

@@ -93,8 +93,17 @@ class CompletionCallback(ABC):
 
 
 class ToolCompletionCallback(CompletionCallback):
-    def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler"):
+    def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler", env_object=None):
         super().__init__(config, scheduler)
+
+        self.env_object = env_object
+        # if env_object is not None, overwrite self._tool_schemas
+        if env_object is not None:
+            self._tool_schemas = [
+                {"type": "function", "function": func.function}
+                for func in self.env_object.tool_manager.tool_map.values()
+            ]
+            print(f"update tool_schemas to {self._tool_schemas}", flush=True)
 
         # TODO: add reward manager to calculate reward score once a sample finish
 
@@ -103,31 +112,30 @@ class ToolCompletionCallback(CompletionCallback):
         if "content" not in message:
             message["content"] = ""
         messages.append(message)
-        finish_reason = completions.choices[0].finish_reason
 
-        # STEP 0: check if we reach max turns
-        if self.max_turns and len(messages) >= self.max_turns:
-            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Reach max turns, done!")
+        action, tools = self.env_object.tool_manager.parse_response(message["content"])
+        
+        # next turn chat completion
+        tool_results = await self.env_object.tool_manager.execute_all_tools([action], [tools])
+        
+        # same logic as in envs/base.py class Env(ABC) - def step()
+        if action == 'answer':
             return
+        elif action in ['error', 'actions']:
+            if type(tool_results) == list:
+                messages.extend(tool_results)
+            elif type(tool_results) == str:
+                messages.append({"role": "tool", "content": tool_results})
+            else:
+                raise ValueError(f"Unexpected type of tool_results: {type(tool_results)}, tool_results: {tool_results}")
+            
+            if self.max_turns and (len(messages) - 1) // 2 >= self.max_turns:
+                print(f"[id={completions.id},turn={len(messages)}] Reach max turns, done!")
+                return
+        else:
+            raise ValueError(f"Invalid action: {action}")
 
-        # STEP 1: check if the model called tools
-        if finish_reason != "tool_calls":
-            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] No tool called, done!")
-            return
-
-        # STEP 2: call tools
-        tool_calls = completions.choices[0].message.tool_calls
-        print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Call {len(tool_calls)} tools")
-        tasks = []
-        for tool_call in tool_calls:
-            tasks.append(self._call_tool(tool_call))
-        tool_responses = await asyncio.gather(*tasks)
-        if any(isinstance(item, Exception) for item in tool_responses):
-            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Error when calling tools, done!")
-            return
-        messages.extend(tool_responses)
-
-        # STEP 3: resubmit completion request with tool responses
+        # resubmit completion request with tool responses
         self.scheduler.submit_chat_completions(messages=messages, request_id=completions.id, info=info)
 
     async def _call_tool(self, tool_call) -> Dict[str, str]:
@@ -182,6 +190,9 @@ class ToolCompletionCallback(CompletionCallback):
         attention_mask = torch.cat([prompts["attention_mask"], responses["attention_mask"]], dim=1)
         position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
 
+        loss_mask = torch.cat([torch.zeros_like(prompts["attention_mask"], dtype=torch.float32),
+                                                response_mask], dim=1)
+
         batch = TensorDict(
             {
                 "prompts": prompts["input_ids"],  # [bsz, prompt_length]
@@ -189,6 +200,7 @@ class ToolCompletionCallback(CompletionCallback):
                 "response_mask": response_mask,  # [bsz, response_length]
                 "input_ids": input_ids,  # [bsz, prompt_length + response_length]
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
+                "loss_mask": loss_mask,  # [bsz, prompt_length + response_length]
                 "position_ids": position_ids,  # [bsz, prompt_length + response_length]
             },
             batch_size=len(input_ids),
@@ -254,6 +266,7 @@ class ChatCompletionScheduler:
         config: DictConfig,
         server_addresses: List[str],
         max_cache_size: int = 10000,
+        env_object=None,
     ):
         """
         Args:
@@ -264,6 +277,7 @@ class ChatCompletionScheduler:
         self.config = config.actor_rollout_ref.rollout
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
+        self.env_object = env_object
 
         # Least requests load balancing
         self.weighted_addresses = [[0, address] for address in server_addresses]
@@ -274,7 +288,7 @@ class ChatCompletionScheduler:
 
         self.background_tasks = set()
         if self.config.multi_turn.completion_callback is None:
-            self.completion_callback = ToolCompletionCallback(config, self)
+            self.completion_callback = ToolCompletionCallback(config, self, env_object)
             logger.warning("completion_callback is None, use ToolCompletionCallback")
         else:
             module_path, class_name = self.config.multi_turn.completion_callback.rsplit(".", 1)
@@ -323,6 +337,7 @@ class ChatCompletionScheduler:
                 address,
                 messages=messages,
                 tools=self.completion_callback.tool_schemas,
+                tool_choice="none", # if tool_choice is "auto" and enable_auto_tools is False, will raise error
                 extra_body=self.completion_callback.extra_body,
                 extra_headers={"x-request-id": request_id},
                 **info["__sampling_params__"],

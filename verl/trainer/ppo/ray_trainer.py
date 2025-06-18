@@ -296,6 +296,7 @@ class RayPPOTrainer:
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name="cuda",
+        env_object=None,
     ):
         """Initialize distributed PPO trainer with Ray backend."""
 
@@ -304,7 +305,7 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
-
+        self.env_object = env_object
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
@@ -628,15 +629,15 @@ class RayPPOTrainer:
 
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            if self.config.actor_rollout_ref.rollout.max_turns is None:
-                if not self.async_rollout_mode:
+            if self.async_rollout_mode:
+                self.async_rollout_manager.wake_up()
+                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                self.async_rollout_manager.sleep()
+            else:
+                if self.config.actor_rollout_ref.rollout.max_turns is None:
                     test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
                 else:
-                    self.async_rollout_manager.wake_up()
-                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-                    self.async_rollout_manager.sleep()
-            else:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences_loop(test_gen_batch_padded)
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences_loop(test_gen_batch_padded)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -786,6 +787,7 @@ class RayPPOTrainer:
             self.async_rollout_manager = AsyncLLMServerManager(
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
+                env_object=self.env_object
             )
         
         if self.use_reward_rollout:
@@ -973,17 +975,18 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
-                        if self.config.actor_rollout_ref.rollout.max_turns is None:
-                            if not self.async_rollout_mode:
+                        if self.async_rollout_mode:
+                            self.async_rollout_manager.wake_up()
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            self.async_rollout_manager.sleep()
+                        else:
+                            if self.config.actor_rollout_ref.rollout.max_turns is None:
                                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                             else:
-                                self.async_rollout_manager.wake_up()
-                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                                self.async_rollout_manager.sleep()
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences_loop(gen_batch)
+                        if "timing" in gen_batch_output.meta_info:
                             timing_raw.update(gen_batch_output.meta_info["timing"])
                             gen_batch_output.meta_info.pop("timing", None)
-                        else:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences_loop(gen_batch)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
