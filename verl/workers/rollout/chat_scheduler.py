@@ -35,6 +35,8 @@ from verl.tools.base_tool import initialize_tools_from_config
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 
+from qwen_agent.llm.schema import SYSTEM, USER, ASSISTANT
+
 logger = logging.getLogger(__file__)
 
 
@@ -95,15 +97,7 @@ class CompletionCallback(ABC):
 class ToolCompletionCallback(CompletionCallback):
     def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler", env_object=None):
         super().__init__(config, scheduler)
-
         self.env_object = env_object
-        # if env_object is not None, overwrite self._tool_schemas
-        if env_object is not None:
-            self._tool_schemas = [
-                {"type": "function", "function": func.function}
-                for func in self.env_object.tool_manager.tool_map.values()
-            ]
-            print(f"update tool_schemas to {self._tool_schemas}", flush=True)
 
         # TODO: add reward manager to calculate reward score once a sample finish
 
@@ -113,10 +107,14 @@ class ToolCompletionCallback(CompletionCallback):
             message["content"] = ""
         messages.append(message)
 
+        if self.max_turns and sum(1 for msg in messages if msg["role"] == ASSISTANT) >= self.max_turns:
+            return
+        
         action, tools = self.env_object.tool_manager.parse_response(message["content"])
         
         # next turn chat completion
         tool_results = await self.env_object.tool_manager.execute_all_tools([action], [tools])
+        tool_results = tool_results[0]
         
         # same logic as in envs/base.py class Env(ABC) - def step()
         if action == 'answer':
@@ -129,9 +127,6 @@ class ToolCompletionCallback(CompletionCallback):
             else:
                 raise ValueError(f"Unexpected type of tool_results: {type(tool_results)}, tool_results: {tool_results}")
             
-            if self.max_turns and (len(messages) - 1) // 2 >= self.max_turns:
-                print(f"[id={completions.id},turn={len(messages)}] Reach max turns, done!")
-                return
         else:
             raise ValueError(f"Invalid action: {action}")
 
@@ -337,7 +332,6 @@ class ChatCompletionScheduler:
                 address,
                 messages=messages,
                 tools=self.completion_callback.tool_schemas,
-                tool_choice="none", # if tool_choice is "auto" and enable_auto_tools is False, will raise error
                 extra_body=self.completion_callback.extra_body,
                 extra_headers={"x-request-id": request_id},
                 **info["__sampling_params__"],
@@ -400,8 +394,23 @@ class ChatCompletionScheduler:
         n = 1 if batch.meta_info.get("validate", False) else self.config.n
         tasks, batch_conversations = [], [None] * len(batch) * n
         for batch_index, conversation in enumerate(batch.non_tensor_batch["raw_prompt"].repeat(n, axis=0)):
-            # raw_prompt: [{"role": "user", "content": ""}, ["role": "assistant", "content"], ...]
-            batch_conversations[batch_index] = conversation.tolist()
+            # raw_prompt: [{"role": "system", "content": ""}, {"role": "user", "content": ""}, ["role": "assistant", "content"], ...]
+            temp_conversation = conversation.tolist()
+            if temp_conversation[0]["role"] == SYSTEM:
+                base_chat = [temp_conversation[0]]
+                system_prompt_with_chat_template = self.env_object.tool_manager.get_prompt(base_chat, self.completion_callback.tokenizer, mode='initial', add_generation_prompt=False)
+                system_prompt = system_prompt_with_chat_template.split("<|im_start|>system")[1].split("<|im_end|>")[0]
+                temp_conversation[0]["content"] = system_prompt
+            elif temp_conversation[0]["role"] == USER:
+                base_chat = [{"role": SYSTEM, "content": ""}]
+                system_prompt_with_chat_template = self.env_object.tool_manager.get_prompt(base_chat, self.completion_callback.tokenizer, mode='initial', add_generation_prompt=False)
+                system_prompt = system_prompt_with_chat_template.split("<|im_start|>system")[1].split("<|im_end|>")[0]
+                temp_conversation.insert(0, {"role": SYSTEM, "content": system_prompt})
+            else:
+                raise ValueError(f"Invalid role: {temp_conversation[0]['role']}")
+            
+
+            batch_conversations[batch_index] = temp_conversation
 
             tasks.append(
                 asyncio.create_task(
