@@ -393,24 +393,27 @@ class ChatCompletionScheduler:
         # validation dataset has already been repeated in `PPOTrainer._validate`.
         n = 1 if batch.meta_info.get("validate", False) else self.config.n
         tasks, batch_conversations = [], [None] * len(batch) * n
+        new_raw_prompt = []
         for batch_index, conversation in enumerate(batch.non_tensor_batch["raw_prompt"].repeat(n, axis=0)):
             # raw_prompt: [{"role": "system", "content": ""}, {"role": "user", "content": ""}, ["role": "assistant", "content"], ...]
             temp_conversation = conversation.tolist()
             if temp_conversation[0]["role"] == SYSTEM:
                 base_chat = [temp_conversation[0]]
                 system_prompt_with_chat_template = self.env_object.tool_manager.get_prompt(base_chat, self.completion_callback.tokenizer, mode='initial', add_generation_prompt=False)
-                system_prompt = system_prompt_with_chat_template.split("<|im_start|>system")[1].split("<|im_end|>")[0]
+                system_prompt = system_prompt_with_chat_template.split("<|im_start|>system\n")[1].split("<|im_end|>")[0]
                 temp_conversation[0]["content"] = system_prompt
             elif temp_conversation[0]["role"] == USER:
                 base_chat = [{"role": SYSTEM, "content": ""}]
                 system_prompt_with_chat_template = self.env_object.tool_manager.get_prompt(base_chat, self.completion_callback.tokenizer, mode='initial', add_generation_prompt=False)
-                system_prompt = system_prompt_with_chat_template.split("<|im_start|>system")[1].split("<|im_end|>")[0]
+                system_prompt = system_prompt_with_chat_template.split("<|im_start|>system\n")[1].split("<|im_end|>")[0]
                 temp_conversation.insert(0, {"role": SYSTEM, "content": system_prompt})
             else:
                 raise ValueError(f"Invalid role: {temp_conversation[0]['role']}")
             
-
             batch_conversations[batch_index] = temp_conversation
+
+            if batch_index % n == 0:
+                new_raw_prompt.append(temp_conversation)
 
             tasks.append(
                 asyncio.create_task(
@@ -422,6 +425,7 @@ class ChatCompletionScheduler:
                 )
             )
 
+        batch.non_tensor_batch["raw_prompt"] = np.array(new_raw_prompt, dtype=object)
         await asyncio.gather(*tasks)
         print("[ChatCompletionScheduler] generate_sequences done")
 
