@@ -101,6 +101,12 @@ class ToolCompletionCallback(CompletionCallback):
 
         # TODO: add reward manager to calculate reward score once a sample finish
 
+    @property
+    def extra_body(self):
+        return {
+            "chat_template_kwargs": {"enable_thinking": self.config.actor_rollout_ref.env.enable_thinking},
+        }
+
     async def __call__(self, messages: List[Dict[str, str]], completions: ChatCompletion, info: Dict[str, Any]):
         message = completions.choices[0].message.model_dump(exclude_unset=True, exclude_none=True)
         if "content" not in message:
