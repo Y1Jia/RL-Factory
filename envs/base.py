@@ -25,7 +25,7 @@ class Env(ABC):
             )
         else:
             # 分布式模式，保持原有逻辑
-            if not tool_manager_name:
+            if tool_manager_name == 'adaptive':
                 model_type = config.get('model_type')
                 if 'qwen3' in model_type:
                     tool_manager_name = 'qwen3'

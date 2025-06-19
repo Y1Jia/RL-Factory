@@ -141,3 +141,24 @@
     ```bash
     tensorboard --logdir=./
     ```
+
+## After Training - Start Evaluate！ 
+
++ Simply adjust main_eval.sh based on main_grpo.sh
+    ```bash
+    set -e -x
+
+    export MODEL_PATH=/the/path/to/model
+    export REWARD_MODEL_PATH=/the/path/to/reward_rollout_model
+
+    python3 -m verl.trainer.main_evaluate\
+    ...
+    data.val_files=path/to/evaluation.parquet\
+    data.val_batch_size=1024\
+    actor_rollout_ref.rollout.val_kwargs.temperature=0\
+    actor_rollout_ref.rollout.val_kwargs.top_k=-1\
+    actor_rollout_ref.rollout.val_kwargs.top_p=1\
+    trainer.val_only=True\
+    trainer.default_local_dir=path_for_results\
+    ...
+    ```

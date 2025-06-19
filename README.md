@@ -81,6 +81,11 @@ For **future progression**, we will continue to prioritize **"easy"** and **"eff
   # Before running, modify MODEL_PATH, REWARD_MODEL_PATH, and several actor_rollout_ref.env parameters as needed
   bash main_grpo.sh
   ```
+- **Evaluate or Infer Command**
+  ```bash
+  # Before running, modify MODEL_PATH, REWARD_MODEL_PATH, and several data and trainer parameters as needed
+  bash main_eval.sh
+  ```
 
 
 ## Demo in DeepSearch Training

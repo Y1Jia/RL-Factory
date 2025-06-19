@@ -31,7 +31,6 @@ class Qwen25Manager(ToolManager):
         if isinstance(verl_config, dict):
             verl_config = OmegaConf.to_container(verl_config)
         super().__init__(verl_config)
-        self.functions = []
         self.generate_cfg = {
             'fncall_prompt_type': 'nous',
             'function_choice': 'auto',  # 注释掉这行
