@@ -49,15 +49,6 @@ def is_sglang_available():
 
 
 @cache
-def is_nvtx_available():
-    try:
-        nvtx_spec = importlib.util.find_spec("nvtx")
-    except ModuleNotFoundError:
-        nvtx_spec = None
-    return nvtx_spec is not None
-
-
-@cache
 def is_trl_available():
     try:
         trl_spec = importlib.util.find_spec("trl")
@@ -107,7 +98,6 @@ def _get_qualified_name(func):
     qualname = func.__qualname__
     return f"{module}.{qualname}"
 
-
 def deprecated(replacement: str = ""):
     """Decorator to mark APIs as deprecated."""
     import functools
@@ -115,7 +105,6 @@ def deprecated(replacement: str = ""):
 
     def decorator(func):
         qualified_name = _get_qualified_name(func)
-
         @functools.wraps(func)
         def wrapped(*args, **kwargs):
             msg = f"Warning: API '{qualified_name}' is deprecated."
@@ -123,7 +112,5 @@ def deprecated(replacement: str = ""):
                 msg += f" Please use '{replacement}' instead."
             warnings.warn(msg, category=DeprecationWarning, stacklevel=2)
             return func(*args, **kwargs)
-
         return wrapped
-
     return decorator

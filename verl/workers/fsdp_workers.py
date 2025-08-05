@@ -65,9 +65,6 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.py_functional import convert_to_regular_types
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
-from verl.protocol import broadcast_data_proto
-from envs.utils.tool_utils import ToolUtils
-from envs import TOOL_ENV_REGISTRY
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -134,15 +131,6 @@ class ActorRolloutRefWorker(Worker):
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
 
-        # 初始化集中式工具管理器Actor句柄
-        self.centralized_tool_actor = None
-        tool_manager_name = self.config.env.get('tool_manager', '')
-        if not tool_manager_name:
-            tool_manager_name = "adaptive"
-
-        if hasattr(self.config, 'env') and tool_manager_name.startswith('centralized_'):
-            self._init_centralized_tool_actor()
-        
         self._is_offload_param = False
         self._is_offload_optimizer = False
         if self._is_actor:
@@ -175,43 +163,6 @@ class ActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
-    def _init_centralized_tool_actor(self):
-        """初始化集中式工具管理器Actor"""
-        import ray
-        from envs.tool_manager.centralized.centralized_qwen3_manager import CentralizedToolActor
-        
-        # 只有rank 0的worker负责创建集中式Actor
-        if self.rank == 0:
-            try:
-                # 尝试获取已存在的Actor
-                centralized_actor = ray.get_actor("centralized_tool_actor")
-                print("发现已存在的集中式工具Actor")
-            except ValueError:
-                # Actor不存在，创建新的
-                print("创建新的集中式工具Actor - rank {}".format(self.rank))
-                centralized_actor = CentralizedToolActor.options(
-                    name="centralized_tool_actor",
-                    max_concurrency=self.config.actor_rollout_ref.env.get('max_concurrency', 10)
-                ).remote(self.config.env)
-            
-            self.centralized_tool_actor = centralized_actor
-        else:
-            # 其他worker等待并获取Actor句柄
-            import time
-            max_wait_time = 60  # 最多等待60秒
-            start_time = time.time()
-            
-            while time.time() - start_time < max_wait_time:
-                try:
-                    self.centralized_tool_actor = ray.get_actor("centralized_tool_actor")
-                    print(f"Worker {self.rank} 成功获取集中式工具Actor")
-                    break
-                except ValueError:
-                    time.sleep(1)  # 等待1秒后重试
-            
-            if self.centralized_tool_actor is None:
-                raise RuntimeError(f"Worker {self.rank} 在{max_wait_time}秒内无法获取集中式工具Actor")
-    
     def _build_model_optimizer(
         self,
         model_path,
@@ -614,12 +565,6 @@ class ActorRolloutRefWorker(Worker):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
-        
-        # 创建环境对象，传递集中式Actor句柄（如果使用集中式模式）
-        self.env_object = TOOL_ENV_REGISTRY[self.config.env.name](
-            config=self.config.env, 
-            centralized_actor=self.centralized_tool_actor
-        )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
@@ -694,85 +639,6 @@ class ActorRolloutRefWorker(Worker):
         timing_generate = reduce_timing(timing_generate)
         output.meta_info["timing"] = timing_generate
         output = output.to("cpu")
-
-        # clear kv cache
-        get_torch_device().empty_cache()
-        return output
-
-
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def generate_sequences_loop(self, prompts: DataProto):
-        prompts = prompts.to(torch.cuda.current_device())
-
-        assert self._is_rollout
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-
-        meta_info = {
-            'eos_token_id':
-                self.generation_config.eos_token_id
-                if self.generation_config is not None else self.tokenizer.eos_token_id,
-            'pad_token_id':
-                self.generation_config.pad_token_id
-                if self.generation_config is not None else self.tokenizer.pad_token_id,
-        }
-
-        prompts.meta_info.update(meta_info)
-
-        su = ToolUtils(self.tokenizer, meta_info, self.rollout.config, env_object=self.env_object)
-
-        with self.rollout_sharding_manager:
-
-            # after parameters sync with rollout, offload actor model to CPU
-            if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            if self._is_offload_optimizer:
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-
-            log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
-            
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-
-            max_turns = self.rollout.config.max_turns
-            tp_group, tp_rank = self.rollout_sharding_manager.get_tp_group_and_rank()
-            
-            for step in range(max_turns):
-                prompts = prompts.to(torch.cuda.current_device())
-                output = self.rollout.generate_sequences(prompts=prompts)
-
-                log_gpu_memory_usage('After rollout generation', logger=logger)
-                output = output.to('cpu')
-                output.meta_info.update(prompts.meta_info)
-                
-                # After rollout_sharding_manager.preprocess_data, all tp rank has identical input and output 
-                # So we only postprocess_out put in tp0
-                # in the end,  we will broadcast output from tp0 to other tprank
-                if tp_rank == 0:
-                    prompts = su.postprocess_output(output, step)
-                    is_finish = prompts is None
-                else:
-                    prompts = DataProto()
-                    is_finish = None
-                object_list = [is_finish]
-                torch.distributed.broadcast_object_list(object_list, group=tp_group, group_src=0)
-                is_finish = object_list[0]
-
-                if is_finish:
-                    break
-                else:
-                    broadcast_data_proto(prompts, process_group=tp_group, group_src=0)
-            
-            dp_group = self.rollout_sharding_manager.get_dp_group()
-            if tp_rank == 0:
-                output = su.compose_final_output(step=step, group=dp_group)
-            else:
-                output = DataProto()
-            broadcast_data_proto(output, process_group=tp_group, group_src=0)
-            
-            output = self.rollout_sharding_manager.postprocess_data(output)
-            
-        output = output.to('cpu')
-
 
         # clear kv cache
         get_torch_device().empty_cache()
@@ -1566,145 +1432,6 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         raise NotImplementedError("AsyncActorRolloutRefWorker does not support generate_sequences")
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    def execute_method(self, method: Union[str, bytes], *args, **kwargs):
-        """Called by ExternalRayDistributedExecutor collective_rpc."""
-        if self.vllm_tp_rank == 0 and method != "execute_model":
-            print(f"[DP={self.vllm_dp_rank},TP={self.vllm_tp_rank}] execute_method: {method if isinstance(method, str) else 'Callable'}")
-        return self.rollout.execute_method(method, *args, **kwargs)
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
-    async def chat_completion(self, json_request):
-        ret = await self.rollout.chat_completion(json_request)
-        return ret
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def wake_up(self):
-        await self.rollout.wake_up()
-        # return something to block the caller
-        return True
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def sleep(self):
-        await self.rollout.sleep()
-        # return something to block the caller
-        return True
-
-
-class RewardRolloutWorker(Worker):
-    """
-    This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
-    or a hybrid engine based on the config.rollout
-    """
-
-    def __init__(self, config: DictConfig, role: str):
-        super().__init__()
-        self.config = config
-        import torch.distributed
-
-        if not torch.distributed.is_initialized():
-            rank = int(os.environ.get("RANK", 0))
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl", rank=rank, world_size=world_size)
-
-        self.role = role
-        assert self.role == 'reward_rollout'
-
-    def _build_rollout(self, trust_remote_code=False):
-        from torch.distributed.device_mesh import init_device_mesh
-
-        # TODO(sgm): support FSDP hybrid shard for larger model
-        infer_tp = self.config.rollout.tensor_model_parallel_size
-        dp = self.world_size // infer_tp
-        assert self.world_size % infer_tp == 0, f"rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}"
-        rollout_device_mesh = init_device_mesh(device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
-        rollout_name = self.config.rollout.name
-
-        from verl.utils.model import get_generation_config
-        from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMRewardShardingManager
-        from verl.workers.rollout.vllm_rollout import vLLMRewardRollout, vLLMAsyncRollout
-
-        log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
-        local_path = copy_to_local(self.config.rollout.model_name, use_shm=self.config.get("use_shm", False))
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=False)
-        self.generation_config = get_generation_config(local_path, trust_remote_code=False)
-
-        vllm_rollout_cls = vLLMRewardRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
-        rollout = vllm_rollout_cls(
-            model_path=local_path, 
-            config=self.config.rollout, 
-            tokenizer=self.tokenizer, 
-            device_mesh=rollout_device_mesh, 
-            trust_remote_code=trust_remote_code)
-
-        log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
-        rollout_sharding_manager = FSDPVLLMRewardShardingManager(
-            inference_engine=rollout.inference_engine,
-            device_mesh=rollout_device_mesh
-        )
-        log_gpu_memory_usage("After building sharding manager", logger=logger)
-
-        return rollout, rollout_sharding_manager
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_model(self):
-        if self.config.rollout.mode == "async":
-            self.rollout, self.rollout_sharding_manager = self._build_rollout_async(
-                trust_remote_code=self.config.get("trust_remote_code", False)
-            )
-        else:
-            self.rollout, self.rollout_sharding_manager = self._build_rollout(
-                trust_remote_code=self.config.get("trust_remote_code", False)
-            )
-
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def generate_sequences(self, prompts: DataProto):
-        # Support all hardwares
-        prompts = prompts.to(get_torch_device().current_device())
-
-        meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
-        }
-        prompts.meta_info.update(meta_info)
-        timing_generate = {}
-        with self.rollout_sharding_manager:
-            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
-
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            with _timer("generate_sequences", timing_generate):
-                output = self.rollout.generate_sequences(prompts=prompts)
-
-            log_gpu_memory_usage("After rollout generation", logger=logger)
-
-            output = self.rollout_sharding_manager.postprocess_data(output)
-
-        timing_generate.update(self.rollout_sharding_manager.timing)
-        # We calculate the average timing across all ranks
-        # to make sure meta_info["timing"] is the same
-        timing_generate = reduce_timing(timing_generate)
-        output.meta_info["timing"] = timing_generate
-        output = output.to("cpu")
-
-        # clear kv cache
-        get_torch_device().empty_cache()
-        return output
-
-    def _build_rollout_async(self, trust_remote_code=False):
-        rollout, rollout_sharding_manager = self._build_rollout(trust_remote_code)
-
-        # NOTE: rollout is not actually initialized here, it's deferred
-        # to be initialized by AsyncvLLMServer.
-
-        self.vllm_tp_size = self.config.rollout.tensor_model_parallel_size
-        self.vllm_dp_rank = int(os.environ["RANK"]) // self.vllm_tp_size
-        self.vllm_tp_rank = int(os.environ["RANK"]) % self.vllm_tp_size
-
-        # used for sleep/wake_up
-        rollout.sharding_manager = rollout_sharding_manager
-
-        return rollout, rollout_sharding_manager
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     def execute_method(self, method: Union[str, bytes], *args, **kwargs):

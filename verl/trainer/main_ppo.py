@@ -15,15 +15,12 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 
-import os
-import json
 import hydra
 import ray
-from envs import TOOL_ENV_REGISTRY
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
-from transformers import AutoConfig
+
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
@@ -80,35 +77,6 @@ class TaskRunner:
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        # 检查是否使用集中式工具管理
-        centralized_tool_actor = None
-        tool_manager_name = config.actor_rollout_ref.env.get('tool_manager', 'qwen3')
-        import ray
-        # 检查是否指定工具管理器，如果没有采用自适应模式Add commentMore actions
-        if not tool_manager_name:
-            tool_manager_name = "adaptive"
-        if tool_manager_name.startswith('centralized_'):
-            from envs.tool_manager.centralized.centralized_qwen3_manager import CentralizedToolActor
-            
-            # 在主进程中创建集中式工具Actor
-            try:
-                centralized_tool_actor = ray.get_actor("centralized_tool_actor")
-                print("- main ppo: 发现已存在的集中式工具Actor")
-            except ValueError:
-                print("- main ppo: 在trainer中创建集中式工具Actor")
-                centralized_tool_actor = CentralizedToolActor.options(
-                    name="centralized_tool_actor",
-                    max_concurrency=config.actor_rollout_ref.env.get('max_concurrency', 10)
-                ).remote(config.actor_rollout_ref.env)
-        
-        model_config = AutoConfig.from_pretrained(local_path)
-        config.actor_rollout_ref.env.model_type = getattr(model_config, "model_type", "unknown")
-
-        env_object = TOOL_ENV_REGISTRY[config.actor_rollout_ref.env.name](
-            config=config.actor_rollout_ref.env,
-            centralized_actor=centralized_tool_actor
-        )
-
         # Version validation for vllm.
         if config.actor_rollout_ref.rollout.name in ["vllm"]:
             from verl.utils.vllm_utils import is_version_ge
@@ -121,7 +89,7 @@ class TaskRunner:
         if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
             assert config.critic.strategy in ["fsdp", "fsdp2"]
             from verl.single_controller.ray import RayWorkerGroup
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker, RewardRolloutWorker
+            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 
             actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
@@ -139,41 +107,22 @@ class TaskRunner:
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
-        use_reward_rollout = config.reward_rollout.if_use_reward_rollout
-        if use_reward_rollout:
-            role_worker_mapping = {
-                Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
-                Role.Critic: ray.remote(CriticWorker),
-                Role.RewardRolloutRef: ray.remote(RewardRolloutWorker)
-            }
-            global_pool_id = 'global_pool'
-            reward_rollout_pool_id = 'reward_rollout_pool'
-            resource_pool_spec = {
-                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-                reward_rollout_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-            }
-            mapping = {
-                Role.ActorRollout: global_pool_id,
-                Role.Critic: global_pool_id,
-                Role.RewardRolloutRef: reward_rollout_pool_id
-            }
-        else:
-            # Map roles to their corresponding remote worker classes.
-            role_worker_mapping = {
-                Role.ActorRollout: ray.remote(actor_rollout_cls),
-                Role.Critic: ray.remote(CriticWorker),
-            }
+        # Map roles to their corresponding remote worker classes.
+        role_worker_mapping = {
+            Role.ActorRollout: ray.remote(actor_rollout_cls),
+            Role.Critic: ray.remote(CriticWorker),
+        }
 
-            # Define the resource pool specification.
-            # Map roles to the resource pool.
-            global_pool_id = "global_pool"
-            resource_pool_spec = {
-                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-            }
-            mapping = {
-                Role.ActorRollout: global_pool_id,
-                Role.Critic: global_pool_id,
-            }
+        # Define the resource pool specification.
+        # Map roles to the resource pool.
+        global_pool_id = "global_pool"
+        resource_pool_spec = {
+            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+        }
+        mapping = {
+            Role.ActorRollout: global_pool_id,
+            Role.Critic: global_pool_id,
+        }
 
         # We should adopt a multi-source reward function here:
         # - for rule-based rm, we directly call a reward score
@@ -198,31 +147,14 @@ class TaskRunner:
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
-        try:
-            reward_fn.set_env_object(env_object)
-        except Exception as e:
-            print(f"Error setting env object for reward_fn: {e}")
-        
-        # stop token
-        reward_fn.stop_token = config.actor_rollout_ref.rollout.stop[0]
-
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
-        try:
-            val_reward_fn.set_env_object(env_object)
-            val_reward_fn.if_val = True
-        except Exception as e:
-            print(f"Error setting env object for val_reward_fn: {e}")
-        
-        # stop token
-        val_reward_fn.stop_token = config.actor_rollout_ref.rollout.stop[0]
-
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, env_object=env_object)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, env_object=env_object)
+        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
+        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
@@ -240,7 +172,6 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
             device_name=config.trainer.device,
-            env_object=env_object
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()
@@ -248,7 +179,7 @@ class TaskRunner:
         trainer.fit()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, env_object=None):
+def create_rl_dataset(data_paths, data_config, tokenizer, processor):
     """Create a dataset.
 
     Arguments:
@@ -283,7 +214,6 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, env_object=
     dataset = dataset_cls(
         data_files=data_paths,
         tokenizer=tokenizer,
-        env_object=env_object, 
         processor=processor,
         config=data_config,
     )
