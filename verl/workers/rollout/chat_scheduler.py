@@ -35,6 +35,8 @@ from verl.tools.base_tool import initialize_tools_from_config
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 
+from qwen_agent.llm.schema import SYSTEM, USER, ASSISTANT
+
 logger = logging.getLogger(__file__)
 
 
@@ -93,41 +95,49 @@ class CompletionCallback(ABC):
 
 
 class ToolCompletionCallback(CompletionCallback):
-    def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler"):
+    def __init__(self, config: DictConfig, scheduler: "ChatCompletionScheduler", env_object=None):
         super().__init__(config, scheduler)
+        self.env_object = env_object
 
         # TODO: add reward manager to calculate reward score once a sample finish
+
+    @property
+    def extra_body(self):
+        return {
+            "chat_template_kwargs": {"enable_thinking": self.config.actor_rollout_ref.env.enable_thinking},
+        }
 
     async def __call__(self, messages: List[Dict[str, str]], completions: ChatCompletion, info: Dict[str, Any]):
         message = completions.choices[0].message.model_dump(exclude_unset=True, exclude_none=True)
         if "content" not in message:
             message["content"] = ""
         messages.append(message)
-        finish_reason = completions.choices[0].finish_reason
 
-        # STEP 0: check if we reach max turns
-        if self.max_turns and len(messages) >= self.max_turns:
-            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Reach max turns, done!")
+        # Check if maximum turns reached
+        if self.max_turns and sum(1 for msg in messages if msg["role"] == ASSISTANT) >= self.max_turns:
             return
-
-        # STEP 1: check if the model called tools
-        if finish_reason != "tool_calls":
-            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] No tool called, done!")
+        
+        # Parse the assistant's response to extract action and tools, and execute all tools
+        action, tools = self.env_object.tool_manager.parse_response(message["content"])
+        tool_results = await self.env_object.tool_manager.execute_all_tools([action], [tools])
+        tool_results = tool_results[0]
+        
+        if action == 'answer':
+            # If action is 'answer', end the conversation
             return
+        elif action in ['error', 'actions']:
+            # extend messages with tool responses
+            if type(tool_results) == list:
+                messages.extend(tool_results)
+            elif type(tool_results) == str:
+                messages.append({"role": "tool", "content": tool_results})
+            else:
+                raise ValueError(f"Unexpected type of tool_results: {type(tool_results)}, tool_results: {tool_results}")
+            
+        else:
+            raise ValueError(f"Invalid action: {action}")
 
-        # STEP 2: call tools
-        tool_calls = completions.choices[0].message.tool_calls
-        print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Call {len(tool_calls)} tools")
-        tasks = []
-        for tool_call in tool_calls:
-            tasks.append(self._call_tool(tool_call))
-        tool_responses = await asyncio.gather(*tasks)
-        if any(isinstance(item, Exception) for item in tool_responses):
-            print(f"[id={completions.id},turn={len(messages)},finish_reason={finish_reason}] Error when calling tools, done!")
-            return
-        messages.extend(tool_responses)
-
-        # STEP 3: resubmit completion request with tool responses
+        # resubmit completion request with tool responses
         self.scheduler.submit_chat_completions(messages=messages, request_id=completions.id, info=info)
 
     async def _call_tool(self, tool_call) -> Dict[str, str]:
@@ -182,6 +192,9 @@ class ToolCompletionCallback(CompletionCallback):
         attention_mask = torch.cat([prompts["attention_mask"], responses["attention_mask"]], dim=1)
         position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
 
+        loss_mask = torch.cat([torch.zeros_like(prompts["attention_mask"], dtype=torch.float32),
+                                                response_mask], dim=1)
+
         batch = TensorDict(
             {
                 "prompts": prompts["input_ids"],  # [bsz, prompt_length]
@@ -189,6 +202,7 @@ class ToolCompletionCallback(CompletionCallback):
                 "response_mask": response_mask,  # [bsz, response_length]
                 "input_ids": input_ids,  # [bsz, prompt_length + response_length]
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
+                "loss_mask": loss_mask,  # [bsz, prompt_length + response_length]
                 "position_ids": position_ids,  # [bsz, prompt_length + response_length]
             },
             batch_size=len(input_ids),
@@ -254,6 +268,7 @@ class ChatCompletionScheduler:
         config: DictConfig,
         server_addresses: List[str],
         max_cache_size: int = 10000,
+        env_object=None,
     ):
         """
         Args:
@@ -264,6 +279,7 @@ class ChatCompletionScheduler:
         self.config = config.actor_rollout_ref.rollout
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
+        self.env_object = env_object
 
         # Least requests load balancing
         self.weighted_addresses = [[0, address] for address in server_addresses]
@@ -274,7 +290,7 @@ class ChatCompletionScheduler:
 
         self.background_tasks = set()
         if self.config.multi_turn.completion_callback is None:
-            self.completion_callback = ToolCompletionCallback(config, self)
+            self.completion_callback = ToolCompletionCallback(config, self, env_object)
             logger.warning("completion_callback is None, use ToolCompletionCallback")
         else:
             module_path, class_name = self.config.multi_turn.completion_callback.rsplit(".", 1)
@@ -384,9 +400,28 @@ class ChatCompletionScheduler:
         # validation dataset has already been repeated in `PPOTrainer._validate`.
         n = 1 if batch.meta_info.get("validate", False) else self.config.n
         tasks, batch_conversations = [], [None] * len(batch) * n
+        new_raw_prompt = []
+        # Process conversations and extract system prompts (with tools description) for each batch item
         for batch_index, conversation in enumerate(batch.non_tensor_batch["raw_prompt"].repeat(n, axis=0)):
-            # raw_prompt: [{"role": "user", "content": ""}, ["role": "assistant", "content"], ...]
-            batch_conversations[batch_index] = conversation.tolist()
+            # raw_prompt: [{"role": "system", "content": ""}, {"role": "user", "content": ""}, ["role": "assistant", "content"], ...]
+            temp_conversation = conversation.tolist()
+            if temp_conversation[0]["role"] == SYSTEM:
+                base_chat = [temp_conversation[0]]
+                system_prompt_with_chat_template = self.env_object.tool_manager.get_prompt(base_chat, self.completion_callback.tokenizer, mode='initial', add_generation_prompt=False)
+                system_prompt = system_prompt_with_chat_template.split("<|im_start|>system\n")[1].split("<|im_end|>")[0]
+                temp_conversation[0]["content"] = system_prompt
+            elif temp_conversation[0]["role"] == USER:
+                base_chat = [{"role": SYSTEM, "content": ""}]
+                system_prompt_with_chat_template = self.env_object.tool_manager.get_prompt(base_chat, self.completion_callback.tokenizer, mode='initial', add_generation_prompt=False)
+                system_prompt = system_prompt_with_chat_template.split("<|im_start|>system\n")[1].split("<|im_end|>")[0]
+                temp_conversation.insert(0, {"role": SYSTEM, "content": system_prompt})
+            else:
+                raise ValueError(f"Invalid role: {temp_conversation[0]['role']}")
+            
+            batch_conversations[batch_index] = temp_conversation
+
+            if batch_index % n == 0:
+                new_raw_prompt.append(temp_conversation)
 
             tasks.append(
                 asyncio.create_task(
@@ -398,6 +433,8 @@ class ChatCompletionScheduler:
                 )
             )
 
+        # the raw_prompt should also update, so that the postprocess can be done correctly
+        batch.non_tensor_batch["raw_prompt"] = np.array(new_raw_prompt, dtype=object)
         await asyncio.gather(*tasks)
         print("[ChatCompletionScheduler] generate_sequences done")
 

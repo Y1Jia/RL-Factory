@@ -23,7 +23,6 @@ from envs import TOOL_ENV_REGISTRY
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
-from transformers import AutoConfig
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
@@ -101,8 +100,10 @@ class TaskRunner:
                     max_concurrency=config.actor_rollout_ref.env.get('max_concurrency', 10)
                 ).remote(config.actor_rollout_ref.env)
         
-        model_config = AutoConfig.from_pretrained(local_path)
-        config.actor_rollout_ref.env.model_type = getattr(model_config, "model_type", "unknown")
+        config_path = os.path.join(local_path, "config.json")
+        with open(config_path, "r", encoding="utf-8") as f:
+            model_config = json.load(f)
+        config.actor_rollout_ref.env.model_type = model_config.get("model_type", "unknown")
 
         env_object = TOOL_ENV_REGISTRY[config.actor_rollout_ref.env.name](
             config=config.actor_rollout_ref.env,
@@ -220,8 +221,9 @@ class TaskRunner:
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
-        # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, env_object=env_object)
+        # Create training and validation datasets.For evaluation, we only need to val dataset.
+        # train_dataset is unuseful for evaluation.
+        train_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, env_object=env_object)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, env_object=env_object)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
@@ -240,7 +242,6 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
             device_name=config.trainer.device,
-            env_object=env_object
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()

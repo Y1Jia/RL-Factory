@@ -100,7 +100,7 @@ class AsyncServerBase(ABC):
 class AsyncLLMServerManager:
     """AsyncLLMServerManager manage a group of vllm instances, i.e AsyncvLLMServer."""
 
-    def __init__(self, config: DictConfig, worker_group: RayWorkerGroup):
+    def __init__(self, config: DictConfig, worker_group: RayWorkerGroup, env_object=None):
         """Initialize AsyncLLMServerManager.
 
         Args:
@@ -110,6 +110,7 @@ class AsyncLLMServerManager:
         self.full_config = config
         self.config = config.actor_rollout_ref
         self.worker_group = worker_group
+        self.env_object = env_object
 
         self.rollout_tp_size = self.config.rollout.tensor_model_parallel_size
         self.rollout_dp_size = self.worker_group.world_size // self.rollout_tp_size
@@ -168,6 +169,7 @@ class AsyncLLMServerManager:
         self.chat_scheduler = ChatCompletionScheduler(
             config=self.full_config,
             server_addresses=self.server_addresses,
+            env_object=self.env_object
         )
 
         self.chat_scheduler_ready.set()

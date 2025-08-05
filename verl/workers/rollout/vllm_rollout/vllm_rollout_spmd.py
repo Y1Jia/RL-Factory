@@ -182,11 +182,17 @@ class vLLMRollout(BaseRollout):
         if vllm_version != "0.3.1":
             kwargs["detokenize"] = False
 
+        if config.get('stop'):
+            kwargs['detokenize'] = True
+        
         # supporting adding any sampling params from the config file
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
 
+        if 'stop' in kwargs.keys():
+            kwargs['stop'] = list(kwargs['stop'])
+        
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 
@@ -413,3 +419,101 @@ class vLLMAsyncRollout:
             return self.wake_up(*args, **kwargs)
         else:
             return self.inference_engine.execute_method(method, *args, **kwargs)
+
+
+class vLLMRewardRollout(vLLMRollout):
+    def __init__(self, model_path: str, config: DictConfig, tokenizer, **kwargs):
+        """A vLLM rollout. It requires the module is supported by the vllm.
+
+        Args:
+            module: module here follows huggingface APIs
+            config: DictConfig
+            tokenizer: the task/model tokenizer
+            model_hf_config: the huggingface config to initiallize the generating model in vllm
+            **kwargs: train_tp, for Megatron Backend to initialize hybrid engine (zero redundancy) process group
+        """
+        BaseRollout.__init__(self)
+        self.config = config
+        assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
+
+        tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
+        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
+        max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
+
+        if kwargs.get("train_tp") is not None:
+            # deployed with megatron
+            import os
+
+            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
+            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
+            if vllm_version in (
+                "0.5.4",
+                "0.6.3",
+            ):
+                train_tp = kwargs.get("train_tp")
+                num_tp_per_train_tp = train_tp // tensor_parallel_size
+                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size, num_tp_per_train_tp=num_tp_per_train_tp)
+            else:
+                vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
+
+        max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
+
+        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+            raise ValueError(
+                "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+                             please increase max_num_batched_tokens or disable chunked prefill"
+            )
+
+        trust_remote_code = kwargs.get("trust_remote_code", False)
+
+        self.inference_engine = LLM(
+            model=model_path,
+            enable_sleep_mode=True,
+            tensor_parallel_size=tensor_parallel_size,
+            distributed_executor_backend="external_launcher",
+            dtype=config.dtype,
+            enforce_eager=config.enforce_eager,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            disable_custom_all_reduce=True,
+            disable_mm_preprocessor_cache=True,
+            skip_tokenizer_init=False,
+            max_model_len=max_model_len,
+            disable_log_stats=config.disable_log_stats,
+            max_num_batched_tokens=max_num_batched_tokens,
+            enable_chunked_prefill=config.enable_chunked_prefill,
+            enable_prefix_caching=True,
+            trust_remote_code=trust_remote_code,
+            seed=config.get("seed", 0),
+        )
+        # Offload vllm model to reduce peak memory usage
+        self.inference_engine.sleep(level=1)
+
+        kwargs = dict(
+            n=1,
+            logprobs=0,  # can be set to 0 and let actor to recompute
+            max_tokens=config.response_length,
+        )
+
+        # # we may detokenize the result all together later
+        if vllm_version != "0.3.1":
+            kwargs["detokenize"] = False
+
+        if config.get('stop'):
+            kwargs['detokenize'] = True
+        
+        # supporting adding any sampling params from the config file
+        for k in config.keys():
+            if hasattr(SamplingParams(), str(k)):
+                kwargs[k] = config.get(k)
+
+        print(f"kwargs: {kwargs}")
+        if 'stop' in kwargs.keys():
+            kwargs['stop'] = list(kwargs['stop'])
+        
+        kwargs['n'] = 1
+        print(f"vllm rollout kwargs: {kwargs}")
+        print(f"type of stop: {type(kwargs['stop'])}")
+        self.sampling_params = SamplingParams(**kwargs)
+
+        self.pad_token_id = tokenizer.pad_token_id
+        self.lora_kwargs = None

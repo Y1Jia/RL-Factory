@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import sys
 import os
 import uuid
 from collections import defaultdict
@@ -74,6 +75,7 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
+    RewardRolloutRef = 7
 
 
 @dataclass
@@ -95,7 +97,7 @@ class ResourcePoolManager:
             resource_pool = RayResourcePool(process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=1, name_prefix=resource_pool_name)
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
-        self._check_resource_available()
+        # self._check_resource_available()
 
     def get_resource_pool(self, role: Role) -> RayResourcePool:
         """Get the resource pool of the worker_cls"""
@@ -295,6 +297,7 @@ class RayPPOTrainer:
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name="cuda",
+        env_object=None,
     ):
         """Initialize distributed PPO trainer with Ray backend."""
 
@@ -303,7 +306,7 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
-
+        self.env_object = env_object
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
@@ -314,6 +317,7 @@ class RayPPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
         self.use_rm = Role.RewardModel in role_worker_mapping
+        self.use_reward_rollout = Role.RewardRolloutRef in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
         self.validation_generations_logger = ValidationGenerationsLogger()
@@ -340,6 +344,8 @@ class RayPPOTrainer:
             self.use_critic = False
         else:
             raise NotImplementedError
+        if config.trainer.val_only:
+            self.use_critic = False
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -580,28 +586,34 @@ class RayPPOTrainer:
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-
+    
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
-
+        
+        # 新增：用于保存完整的输入输出对应关系
+        validation_samples = []
+    
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
-
+    
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
-
+    
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
-
+    
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            
+            # 保存当前批次的输入
+            current_batch_inputs = input_texts.copy()
             sample_inputs.extend(input_texts)
-
+    
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
             if "multi_modal_data" in test_batch.non_tensor_batch:
@@ -614,7 +626,7 @@ class RayPPOTrainer:
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
-
+    
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -623,42 +635,75 @@ class RayPPOTrainer:
                 "validate": True,
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
-
+    
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
+            if self.async_rollout_mode:
                 self.async_rollout_manager.wake_up()
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
                 self.async_rollout_manager.sleep()
+            else:
+                if self.config.actor_rollout_ref.rollout.max_turns is None:
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                else:
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences_loop(test_gen_batch_padded)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print("validation generation end")
-
+    
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            
+            # 保存当前批次的输出
+            current_batch_outputs = output_texts.copy()
             sample_outputs.extend(output_texts)
-
+    
             test_batch = test_batch.union(test_output_gen_batch)
-
+    
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
+            
+            # 保存当前批次的分数
+            current_batch_scores = scores.copy()
             sample_scores.extend(scores)
-
+    
+            # 新增：保存当前批次的完整输入输出对应关系
+            current_batch_data_sources = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+            
+            for i, (input_text, output_text, score) in enumerate(zip(current_batch_inputs, current_batch_outputs, current_batch_scores)):
+                sample_data = {
+                    "input": input_text,
+                    "output": output_text,
+                    "score": score,
+                    "data_source": current_batch_data_sources[i] if i < len(current_batch_data_sources) else "unknown",
+                    "batch_index": len(validation_samples) // len(current_batch_inputs),  # 批次索引
+                    "sample_index": i  # 在批次内的索引
+                }
+                
+                # 添加额外的奖励信息（如果有的话）
+                if "reward_extra_info" in result:
+                    for key, lst in result["reward_extra_info"].items():
+                        if i < len(lst):
+                            sample_data[f"extra_{key}"] = lst[i]
+                
+                validation_samples.append(sample_data)
+    
             reward_extra_infos_dict["reward"].extend(scores)
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
-
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-
+    
+            data_source_lst.append(current_batch_data_sources)
+    
+        # 保存完整的验证样本数据
+        self._save_validation_samples(validation_samples)
+    
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
+    
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
@@ -669,12 +714,12 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
             )
-
+    
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-
+    
         data_sources = np.concatenate(data_source_lst, axis=0)
-
+    
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -688,8 +733,63 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
-
+    
         return metric_dict
+
+    def _save_validation_samples(self, validation_samples):
+        """保存验证样本数据到文件"""
+        import json
+        import os
+        from datetime import datetime
+        
+        # 获取保存路径
+        val_data_dir = self.config.trainer.default_local_dir
+    
+        if val_data_dir is None:
+            # 使用默认目录
+            val_data_dir = "validation_samples"
+            print(f"Warning: default_local_dir not configured, using default: {val_data_dir}")
+        else:
+            # 在配置的目录下创建validation_samples子目录
+            val_data_dir = os.path.join(val_data_dir, "validation_samples")
+
+        try:
+            os.makedirs(val_data_dir, exist_ok=True)
+            print(f"Validation data directory: {val_data_dir}")
+        except Exception as e:
+            print(f"Failed to create directory {val_data_dir}: {e}")
+            return
+        
+        # 生成时间戳
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 保存为JSON格式
+        json_path = os.path.join(val_data_dir, f"validation_samples_{timestamp}.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(validation_samples, f, ensure_ascii=False, indent=2)
+        
+        # 保存为CSV格式（可选）
+        try:
+            import pandas as pd
+            csv_path = os.path.join(val_data_dir, f"validation_samples_{timestamp}.csv")
+            df = pd.DataFrame(validation_samples)
+            df.to_csv(csv_path, index=False, encoding='utf-8')
+            print(f"Validation samples saved to: {json_path} and {csv_path}")
+        except ImportError:
+            print(f"Validation samples saved to: {json_path}")
+        
+        # 打印统计信息
+        print(f"Total validation samples: {len(validation_samples)}")
+        if validation_samples:
+            avg_score = sum(sample['score'] for sample in validation_samples) / len(validation_samples)
+            print(f"Average score: {avg_score:.4f}")
+            
+            # 按数据源统计
+            data_source_counts = {}
+            for sample in validation_samples:
+                source = sample.get('data_source', 'unknown')
+                data_source_counts[source] = data_source_counts.get(source, 0) + 1
+            print(f"Data source distribution: {data_source_counts}")
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -719,6 +819,13 @@ class RayPPOTrainer:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
             self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
+        
+        if self.use_reward_rollout:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardRolloutRef)
+            reward_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.RewardRolloutRef],
+                                                      config=self.config.reward_rollout,
+                                                      role='reward_rollout')
+            self.resource_pool_to_cls[resource_pool]['reward_rollout'] = reward_rollout_cls
 
         # create reference policy if needed
         if self.use_reference_policy:
@@ -748,7 +855,7 @@ class RayPPOTrainer:
             wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, device_name=self.device_name, **wg_kwargs)
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
-
+        
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
             self.critic_wg.init_model()
@@ -774,7 +881,31 @@ class RayPPOTrainer:
             self.async_rollout_manager = AsyncLLMServerManager(
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
+                env_object=self.env_object
             )
+        
+        if self.use_reward_rollout:
+            print(f"Preparing to initialize reward_rollout_wg. Keys in all_wg: {all_wg.keys()}")
+            try:
+                self.reward_rollout_wg = all_wg['reward_rollout']
+                print(f"Starting reward_rollout_wg.init_model()")
+                self.reward_rollout_wg.init_model()
+                print(f"Finished reward_rollout_wg.init_model() successfully")
+            except Exception as e:
+                import traceback
+                print(f"Error initializing reward_rollout_wg: {e}")
+                print(traceback.format_exc())
+                raise
+            
+            self.reward_fn.set_reward_rollout_wg(self.reward_rollout_wg)
+            self.val_reward_fn.set_reward_rollout_wg(self.reward_rollout_wg)
+
+            from verl.utils.fs import copy_to_local
+            from verl.utils import hf_tokenizer
+            reward_local_path = copy_to_local(self.config.reward_rollout.rollout.model_name)
+            reward_tokenizer = hf_tokenizer(reward_local_path, trust_remote_code=False)
+            self.reward_fn.set_reward_tokenizer(reward_tokenizer)
+            self.val_reward_fn.set_reward_tokenizer(reward_tokenizer)
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -826,7 +957,7 @@ class RayPPOTrainer:
         # find global_step_folder
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
-                print("Training from scratch")
+                print("Training from scratch",file=sys.stderr, flush=True)
                 return 0
         else:
             if self.config.trainer.resume_mode == "resume_path":
@@ -898,6 +1029,8 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
+        if self.config.trainer.get("val_only", False):
+            self.config.trainer.val_before_train = True
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
@@ -905,7 +1038,6 @@ class RayPPOTrainer:
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
-
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -924,6 +1056,7 @@ class RayPPOTrainer:
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                 if "multi_modal_data" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("multi_modal_data")
+                    non_tensor_batch_keys_to_pop.append("multi_modal_inputs")
                 if "raw_prompt" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
                 if "tools_kwargs" in batch.non_tensor_batch:
@@ -938,14 +1071,18 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        else:
+                        if self.async_rollout_mode:
                             self.async_rollout_manager.wake_up()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                        else:
+                            if self.config.actor_rollout_ref.rollout.max_turns is None:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            else:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences_loop(gen_batch)
+                        if "timing" in gen_batch_output.meta_info:
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):

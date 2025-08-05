@@ -99,6 +99,7 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        self.num_gpus = 0.1 if 'reward_rollout' in self.name_prefix else 0.9
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -113,7 +114,8 @@ class RayResourcePool(ResourcePool):
 
         bundle = {"CPU": self.max_colocate_count}
         if self.use_gpu:
-            bundle[device_name] = 1
+            if device_name in ["GPU", "NPU"]:
+                bundle[device_name] = self.num_gpus
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
@@ -273,7 +275,7 @@ class RayWorkerGroup(WorkerGroup):
         if worker_names is not None and (not self.fused_worker_used):
             assert self._is_init_with_detached_workers
             self._worker_names = worker_names
-
+        
         if self._is_init_with_detached_workers:
             self._init_with_detached_workers(worker_names=worker_names, worker_handles=worker_handles)
         else:
@@ -324,7 +326,8 @@ class RayWorkerGroup(WorkerGroup):
         world_size = resource_pool.world_size
         self._world_size = world_size
         # cia.add_kwarg("_world_size", world_size)
-        num_gpus = 1 / resource_pool.max_colocate_count
+        # num_gpus = 1 / resource_pool.max_colocate_count
+        num_gpus = resource_pool.num_gpus
 
         rank = -1
         local_world_size = resource_pool.store[0]
