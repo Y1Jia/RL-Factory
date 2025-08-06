@@ -722,6 +722,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.env_object = TOOL_ENV_REGISTRY[self.config.env.name](
             config=self.config.env, 
             centralized_actor=self.centralized_tool_actor
+        )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red", role="actor_update")

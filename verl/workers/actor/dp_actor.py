@@ -400,7 +400,7 @@ class DataParallelPPOActor(BasePPOActor):
                     attention_mask = model_inputs["attention_mask"]
                     response_length = responses.size(1)
                     if multi_turn or self.config.state_masking:
-                        response_mask = data["loss_mask"][:, -response_length:]
+                        response_mask = model_inputs["loss_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]
                     old_log_prob = model_inputs["old_log_probs"]
