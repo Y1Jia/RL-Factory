@@ -418,7 +418,7 @@ class ChatCompletionScheduler:
 
         # NOTE: For multi-turn rollout, repeat raw_prompt n times and process each prompt independently,
         # validation dataset has already been repeated in `PPOTrainer._validate`.
-        n = 1 if batch.meta_info.get("validate", False) else self.config.n
+        n = 1
         tasks, batch_conversations = [], [None] * len(batch) * n
         new_raw_prompt = []
         # Process conversations and extract system prompts (with tools description) for each batch item
